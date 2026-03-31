@@ -16,7 +16,7 @@ from transformers.trainer_utils import get_last_checkpoint
 import datasets
 import swanlab
 
-from utils import load_model, load_processor
+from utils import load_model, load_deepstack_model, load_processor
 
 
 device = "cuda"
@@ -46,6 +46,10 @@ class StagedTrainingArgs(TrainingArguments):
     stage1_epochs: int = 1
     stage2_epochs: int = 1
     stage3_epochs: int = 1
+
+    # DeepStack 配置
+    use_deepstack: bool = False             # 是否使用 DeepStack 多层视觉特征注入
+    deepstack_layer_indexes: str = "3,7,11" # DeepStack 提取的视觉层索引（逗号分隔）
     
     # 各阶段的学习率
     stage1_lr: float = 1e-4
@@ -199,29 +203,41 @@ def apply_stage_freeze(model, stage: str):
         print("冻结视觉编码器...")
         for _, param in model.model.vision_model.named_parameters():
             param.requires_grad = False
-            
+
         print("冻结文本模型...")
         for _, param in model.model.text_model.named_parameters():
             param.requires_grad = False
-            
+
         print("只训练连接器...")
         for _, param in model.model.connector.named_parameters():
             param.requires_grad = True
-            
+
+        # DeepStack: 同时训练 deepstack_connectors
+        if hasattr(model, 'deepstack_connectors'):
+            print("训练 DeepStack connectors...")
+            for _, param in model.deepstack_connectors.named_parameters():
+                param.requires_grad = True
+
     elif stage == "stage2":
         # 阶段2: 训练视觉+连接器，冻结文本
         print("解冻视觉编码器...")
         for _, param in model.model.vision_model.named_parameters():
             param.requires_grad = True
-            
+
         print("保持连接器可训练...")
         for _, param in model.model.connector.named_parameters():
             param.requires_grad = True
-            
+
         print("冻结文本模型...")
         for _, param in model.model.text_model.named_parameters():
             param.requires_grad = False
-            
+
+        # DeepStack: 保持 deepstack_connectors 可训练
+        if hasattr(model, 'deepstack_connectors'):
+            print("保持 DeepStack connectors 可训练...")
+            for _, param in model.deepstack_connectors.named_parameters():
+                param.requires_grad = True
+
     elif stage == "stage3":
         # 阶段3: 全量微调
         print("全量微调：所有参数都可训练...")
@@ -435,7 +451,14 @@ def main(training_args):
     # 初始化模型和处理器
     print("正在加载模型和处理器...")
     processor = load_processor()
-    model = load_model(device)
+
+    # 根据配置选择普通模型或 DeepStack 模型
+    if training_args.use_deepstack:
+        deepstack_indexes = [int(x.strip()) for x in training_args.deepstack_layer_indexes.split(",")]
+        print(f"使用 DeepStack 模型，视觉层索引: {deepstack_indexes}")
+        model = load_deepstack_model(device, deepstack_layer_indexes=deepstack_indexes)
+    else:
+        model = load_model(device)
     
     # 准备训练数据
     print(f"正在加载数据集: {training_args.train_data}")

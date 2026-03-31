@@ -3,6 +3,7 @@ import os  # 操作系统接口，用于文件路径操作
 import sys  # 系统相关的参数和函数
 from dataclasses import dataclass  # 数据类装饰器
 from functools import partial  # 偏函数工具
+from typing import Optional  # 类型提示
 from PIL import Image  # Python图像处理库
 
 import torch  # PyTorch深度学习框架
@@ -15,7 +16,7 @@ from transformers.trainer_utils import get_last_checkpoint  # 获取最新检查
 import datasets  # HuggingFace数据集库
 import swanlab  # 实验跟踪和可视化工具
 
-from utils import load_model, load_processor  # 导入自定义的模型和处理器加载函数
+from utils import load_model, load_deepstack_model, load_processor  # 导入自定义的模型和处理器加载函数
 
 device = "cuda"  # 设置运行设备为GPU
 
@@ -69,7 +70,7 @@ def load_mm_data(select_data):
     elif select_data in all_data_names:
         tmp_data = [select_data]   # 使用指定的单个数据集
     else:
-        raise f"cannot find {tmp_data}"  # 抛出错误：找不到指定数据集
+        raise ValueError(f"cannot find {select_data}")  # 抛出错误：找不到指定数据集
 
     # 逐个加载数据集并合并
     data_list = []
@@ -104,30 +105,31 @@ def load_mm_data(select_data):
 def freeze_model(qwen_smvl):
     """
     冻结模型的大部分参数，只训练连接器层
-    
+
     这是一种高效的微调策略：
     - 冻结视觉编码器：保持图像特征提取能力
-    - 冻结语言模型：保持文本生成能力  
+    - 冻结语言模型：保持文本生成能力
     - 只训练连接器：学习视觉特征到语言特征的映射
-    
+
     Args:
         qwen_smvl: 要冻结的多模态模型
-    
+
     Returns:
         qwen_smvl: 冻结参数后的模型
     """
     # 冻结文本模型（语言模型）的所有参数
     for _, param in qwen_smvl.model.text_model.named_parameters():
         param.requires_grad = False
-    
+
     # 冻结视觉模型（图像编码器）的所有参数
     for _, param in qwen_smvl.model.vision_model.named_parameters():
         param.requires_grad = False
-    
-    # 注释掉的代码：如果需要也可以冻结语言模型头部
-    # for _, param in qwen_smvl.lm_head.named_parameters():
-    #     param.requires_grad = False
-    
+
+    # 如果是 DeepStack 模型，确保 deepstack_connectors 可训练
+    if hasattr(qwen_smvl, 'deepstack_connectors'):
+        for _, param in qwen_smvl.deepstack_connectors.named_parameters():
+            param.requires_grad = True
+
     return qwen_smvl
 
 
@@ -260,7 +262,11 @@ class MyTrainArgs(TrainingArguments):
     train_data: str = "cocoqa"              # 训练数据集名称，默认使用cocoqa
     seed: int = 42                          # 随机种子，确保实验可复现
     data_seed: int = 42                     # 数据划分的随机种子
-    max_steps: Optional[int] = None  # 最大训练步数
+    max_steps: Optional[int] = None         # 最大训练步数
+
+    # DeepStack 配置
+    use_deepstack: bool = False             # 是否使用 DeepStack 多层视觉特征注入
+    deepstack_layer_indexes: str = "3,7,11" # DeepStack 提取的视觉层索引（逗号分隔）
     
     # 批量大小设置
     per_device_train_batch_size: int = 1    # 每个设备的训练批量大小
@@ -319,7 +325,14 @@ def main(training_args):
     ################
     print("正在加载模型和处理器...")
     qwen_smvl_processor = load_processor()  # 加载数据处理器（分词器+图像处理器）
-    qwen_smvl = load_model(device)          # 加载多模态模型到GPU
+
+    # 根据配置选择普通模型或 DeepStack 模型
+    if training_args.use_deepstack:
+        deepstack_indexes = [int(x.strip()) for x in training_args.deepstack_layer_indexes.split(",")]
+        print(f"使用 DeepStack 模型，视觉层索引: {deepstack_indexes}")
+        qwen_smvl = load_deepstack_model(device, deepstack_layer_indexes=deepstack_indexes)
+    else:
+        qwen_smvl = load_model(device)          # 加载多模态模型到GPU
     
     # 应用参数冻结策略：只训练连接器层，冻结视觉编码器和语言模型
     print("应用参数冻结策略...")

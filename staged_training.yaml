@@ -6,6 +6,10 @@ train_data: "all"
 seed: 42
 data_seed: 42
 
+# DeepStack 配置
+use_deepstack: true
+deepstack_layer_indexes: "3,7,11"
+
 # 分阶段训练参数
 training_stage: "all"  # stage1, stage2, stage3, all
 resume_from_stage: null  # 从指定阶段恢复训练

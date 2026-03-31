@@ -13,7 +13,468 @@ from transformers import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMConnector
 
+# 增强版工具函数
+# 支持 DeepStack 多层视觉特征注入
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any, Union
+import torch
+import torch.nn as nn
+from transformers import (
+    AutoProcessor,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+)
+from transformers.models.smolvlm.modeling_smolvlm import SmolVLMConnector
 
+
+# ============================================================
+# DeepStack 相关组件
+# ============================================================
+
+class DeepStackConnectors(nn.Module):
+    """
+    DeepStack 的可训练部分：多层独立 Connector
+    
+    每个 Connector 负责将视觉编码器某一层的特征
+    从 vision 空间 (768d) 投影到 LLM 空间 (1024d)
+    
+    内部结构与主 Connector 完全一致：
+        pixel_shuffle (scale_factor=4) → Linear(12288→1024)
+    """
+    
+    def __init__(
+        self,
+        num_layers: int,
+        vision_hidden_size: int = 768,
+        text_hidden_size: int = 1024,
+        scale_factor: int = 4,
+    ):
+        super().__init__()
+        self.connectors = nn.ModuleList()
+        for _ in range(num_layers):
+            self.connectors.append(
+                self._create_connector(vision_hidden_size, text_hidden_size, scale_factor)
+            )
+    
+    def _create_connector(self, vision_hidden_size, text_hidden_size, scale_factor):
+        @dataclass
+        class VisionConfig:
+            hidden_size: int = 0
+        @dataclass
+        class TextConfig:
+            hidden_size: int = 0
+        @dataclass
+        class ConnectorConfig:
+            scale_factor: int = 0
+            vision_config: VisionConfig = field(default_factory=VisionConfig)
+            text_config: TextConfig = field(default_factory=TextConfig)
+        
+        config = ConnectorConfig(
+            scale_factor=scale_factor,
+            vision_config=VisionConfig(hidden_size=vision_hidden_size),
+            text_config=TextConfig(hidden_size=text_hidden_size),
+        )
+        return SmolVLMConnector(config)
+
+
+class DeepStackModelWrapper(nn.Module):
+    """
+    将 DeepStack 功能包装到原始模型中
+    
+    核心机制（全部基于 hook，零代码侵入）：
+    
+    1. Vision Encoder hook（捕获）：
+       在视觉编码器的指定层注册 hook，当 base_model.forward()
+       执行视觉编码时，自动捕获中间层输出，无需手动执行或复制预处理
+    
+    2. LLM hook（注入）：
+       在 Qwen3 的前几层注册 hook，将捕获到的视觉特征
+       经过 Connector 后，以残差相加方式注入到 hidden_states
+    
+    整体流程（在一次 forward 中自动完成）：
+       base_model.forward(pixel_values, input_ids, ...)
+         → Vision Encoder 逐层执行
+             → Layer 3 完成后: hook 自动捕获特征
+             → Layer 7 完成后: hook 自动捕获特征
+             → Layer 11 完成后: hook 自动捕获特征
+         → 主 Connector → 替换 embedding（原始逻辑）
+         → Qwen3 LLM 逐层执行
+             → Layer 0 完成后: hook 取出捕获的特征 → Connector[0] → 残差相加
+             → Layer 1 完成后: hook 取出捕获的特征 → Connector[1] → 残差相加
+             → Layer 2 完成后: hook 取出捕获的特征 → Connector[2] → 残差相加
+             → Layer 3~27: 正常执行
+         → lm_head → logits
+    """
+    
+    def __init__(
+        self,
+        base_model,
+        deepstack_layer_indexes: List[int] = None,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ):
+        super().__init__()
+        
+        if deepstack_layer_indexes is None:
+            deepstack_layer_indexes = [3, 7, 11]
+        
+        self.base_model = base_model
+        self.deepstack_layer_indexes = deepstack_layer_indexes
+        self.image_token_id = base_model.image_token_id
+        
+        # 可训练的 DeepStack Connectors
+        self.deepstack_connectors = DeepStackConnectors(
+            num_layers=len(deepstack_layer_indexes),
+            vision_hidden_size=768,
+            text_hidden_size=1024,
+            scale_factor=4,
+        ).to(device=device, dtype=dtype)
+        
+        # 存储 hook 捕获的视觉中间层特征
+        self._captured_vision_features = {}
+        # 存储当前 batch 的 input_ids（用于定位 image token）
+        self._current_input_ids = None
+        
+        # hook 句柄列表（用于后续移除）
+        self._vision_hooks = []
+        self._llm_hooks = []
+        
+        # 注册所有 hook
+        self._register_vision_hooks()
+        self._register_llm_hooks()
+    
+    # ==================== Hook 注册 ====================
+    
+    def _register_vision_hooks(self):
+        """在视觉编码器的指定层注册捕获 hook"""
+        for hook in self._vision_hooks:
+            hook.remove()
+        self._vision_hooks = []
+        
+        vision_layers = self.base_model.model.vision_model.encoder.layers
+        
+        for idx, layer_idx in enumerate(self.deepstack_layer_indexes):
+            hook = vision_layers[layer_idx].register_forward_hook(
+                self._make_vision_capture_hook(idx)
+            )
+            self._vision_hooks.append(hook)
+        
+        print(f"DeepStack: 视觉层 {self.deepstack_layer_indexes} 已注册捕获 hook")
+    
+    def _register_llm_hooks(self):
+        """在 LLM 的前 N 层注册注入 hook"""
+        for hook in self._llm_hooks:
+            hook.remove()
+        self._llm_hooks = []
+        
+        llm_layers = self.base_model.model.text_model.layers
+        num_inject = len(self.deepstack_layer_indexes)
+        
+        for inject_idx in range(num_inject):
+            hook = llm_layers[inject_idx].register_forward_hook(
+                self._make_llm_inject_hook(inject_idx)
+            )
+            self._llm_hooks.append(hook)
+        
+        print(f"DeepStack: LLM 层 {list(range(num_inject))} 已注册注入 hook")
+    
+    # ==================== Hook 函数 ====================
+    
+    def _make_vision_capture_hook(self, capture_idx: int):
+        """
+        创建视觉层捕获 hook
+        
+        当 base_model 内部执行 vision_encoder 时，
+        指定层的输出会被自动捕获存储。
+        
+        Args:
+            capture_idx: 在 captured_features 中的存储索引 (0, 1, 2)
+        """
+        def hook_fn(module, input, output):
+            # encoder_layer 输出格式: (hidden_states, ...)
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+            # 存储该层的输出（detach 避免影响原始计算图，clone 避免被后续层覆盖）
+            # 不 detach：让梯度可以流回视觉编码器（stage2/3需要）
+            self._captured_vision_features[capture_idx] = hidden_states.detach().clone().contiguous()
+        
+        return hook_fn
+    
+    def _make_llm_inject_hook(self, inject_idx: int):
+        """
+        创建 LLM 层注入 hook
+        
+        当 base_model 内部执行 Qwen3 decoder layer 时，
+        在指定层的输出上，对 image_token 位置做残差相加。
+        
+        流程：
+        1. 从 _captured_vision_features 取出对应的视觉特征
+        2. 通过 Connector 投影到 LLM 空间
+        3. reshape 为 [total_image_tokens, 1024]
+        4. 在 image_token 位置残差相加
+        
+        Args:
+            inject_idx: 对应 deepstack_connectors 的索引 (0, 1, 2)
+        """
+        def hook_fn(module, input, output):
+            # 检查是否有捕获到的视觉特征
+            if inject_idx not in self._captured_vision_features:
+                return output
+            if self._current_input_ids is None:
+                return output
+            
+            # 取出 decoder layer 的 hidden_states
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+            
+            # 关键修复：generate 后续 step 中 hidden_states 只有 1 个 token
+            # 此时 seq_len 与 _current_input_ids 的长度不匹配，直接跳过
+            if hidden_states.shape[1] != self._current_input_ids.shape[1]:
+                return output
+            
+            # 构建 image token 位置掩码
+            visual_pos_mask = (self._current_input_ids == self.image_token_id)
+            
+            # 无 image token 时跳过
+            if not visual_pos_mask.any():
+                return output
+            
+            # 取出捕获的视觉特征并通过 Connector
+            vision_feature = self._captured_vision_features[inject_idx]
+            projected = self.deepstack_connectors.connectors[inject_idx](
+                vision_feature.contiguous()
+            )
+            
+            # 展平为 [total_image_tokens, 1024]
+            visual_embeds = projected.reshape(-1, projected.shape[-1])
+            visual_embeds = visual_embeds.to(
+                device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            
+            # 验证数量对齐
+            num_positions = visual_pos_mask.sum().item()
+            num_embeds = visual_embeds.shape[0]
+            
+            if num_positions != num_embeds:
+                print(
+                    f"⚠️ DeepStack inject_idx={inject_idx}: "
+                    f"positions={num_positions} != embeds={num_embeds}, 跳过"
+                )
+                return output
+            
+            # 残差相加（detach hidden_states 避免梯度回传穿过冻结的 LLM 层）
+            local_values = hidden_states[visual_pos_mask].detach().clone() + visual_embeds
+            hidden_states[visual_pos_mask] = local_values
+            
+            if isinstance(output, tuple):
+                return (hidden_states,) + output[1:]
+            else:
+                return hidden_states
+        
+        return hook_fn
+    
+    # ==================== 核心方法 ====================
+    
+    def forward(
+        self,
+        input_ids=None,
+        pixel_values=None,
+        attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        """
+        DeepStack 增强的前向传播
+        
+        只需要设置 _current_input_ids，然后调用 base_model.forward()
+        所有的捕获和注入都由 hook 自动完成
+        """
+        # 清理上一次的状态
+        self._captured_vision_features.clear()
+        self._current_input_ids = input_ids
+        
+        try:
+            outputs = self.base_model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            # 清理状态
+            self._captured_vision_features.clear()
+            self._current_input_ids = None
+        
+        return outputs
+    
+    def generate(self, input_ids=None, pixel_values=None, attention_mask=None, **kwargs):
+        """
+        DeepStack 增强的生成
+        
+        generate 内部会多次调用 forward：
+        - 第1次: 完整序列，含 image_token → vision hook 捕获 + llm hook 注入
+        - 后续: 只有新 token，无 image_token → llm hook 检测后跳过
+        
+        注意：_current_input_ids 在整个 generate 期间保持为初始的完整 input_ids
+        但这不影响正确性，因为后续 step 的 hidden_states 形状是 [B, 1, hidden]
+        visual_pos_mask 作用在完整 input_ids 上会选出图像位置，
+        但 hidden_states 只有 1 个 token，索引不会命中，hook 自然跳过。
+        
+        更准确地说：后续 step 中 base_model 内部传给 text_model 的是
+        inputs_embeds 而非 input_ids（通过 KV cache），
+        所以 vision encoder 不会再被调用，vision hook 也不会触发。
+        llm hook 虽然触发，但 visual_pos_mask.any() 为 False（因为
+        后续 step 的 input_ids 不含 image_token），直接 return。
+        """
+        self._captured_vision_features.clear()
+        self._current_input_ids = input_ids
+        
+        try:
+            outputs = self.base_model.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        finally:
+            self._captured_vision_features.clear()
+            self._current_input_ids = None
+        
+        return outputs
+    
+    # ==================== 属性委托 ====================
+    
+    @property
+    def config(self):
+        return self.base_model.config
+    
+    @property
+    def device(self):
+        return self.base_model.device
+    
+    @property
+    def dtype(self):
+        return self.base_model.dtype
+    
+    @property
+    def generation_config(self):
+        return self.base_model.generation_config
+    
+    @generation_config.setter
+    def generation_config(self, value):
+        self.base_model.generation_config = value
+    
+    @property
+    def vocab_size(self):
+        return self.base_model.vocab_size
+    
+    @property
+    def model(self):
+        return self.base_model.model
+    
+    @property
+    def lm_head(self):
+        return self.base_model.lm_head
+    
+    # ==================== 参数管理 ====================
+    
+    def named_parameters(self, *args, **kwargs):
+        yield from self.base_model.named_parameters(*args, **kwargs)
+        for name, param in self.deepstack_connectors.named_parameters(*args, **kwargs):
+            yield f"deepstack_connectors.{name}", param
+    
+    def parameters(self, *args, **kwargs):
+        yield from self.base_model.parameters(*args, **kwargs)
+        yield from self.deepstack_connectors.parameters(*args, **kwargs)
+    
+    def train(self, mode=True):
+        self.base_model.train(mode)
+        self.deepstack_connectors.train(mode)
+        return self
+    
+    def eval(self):
+        self.base_model.eval()
+        self.deepstack_connectors.eval()
+        return self
+    
+    # ==================== 保存/加载 ====================
+    
+    def save_pretrained(self, output_dir, **kwargs):
+        import os, json
+        os.makedirs(output_dir, exist_ok=True)
+        
+        self.base_model.save_pretrained(output_dir, **kwargs)
+        
+        deepstack_path = os.path.join(output_dir, "deepstack_connectors.bin")
+        torch.save(self.deepstack_connectors.state_dict(), deepstack_path)
+        
+        config_path = os.path.join(output_dir, "deepstack_config.json")
+        with open(config_path, "w") as f:
+            json.dump({
+                "deepstack_layer_indexes": self.deepstack_layer_indexes,
+                "vision_hidden_size": 768,
+                "text_hidden_size": 1024,
+                "scale_factor": 4,
+            }, f, indent=2)
+        
+        print(f"DeepStack 参数已保存到: {deepstack_path}")
+    
+    def load_deepstack_weights(self, checkpoint_dir):
+        import os
+        deepstack_path = os.path.join(checkpoint_dir, "deepstack_connectors.bin")
+        if os.path.exists(deepstack_path):
+            state_dict = torch.load(deepstack_path, map_location=self.device)
+            self.deepstack_connectors.load_state_dict(state_dict)
+            print(f"✅ DeepStack 权重已从 {deepstack_path} 加载")
+        else:
+            print(f"⚠️ 未找到 DeepStack 权重: {deepstack_path}")
+    
+    def remove_all_hooks(self):
+        """移除所有 hook（模型销毁前调用）"""
+        for hook in self._vision_hooks:
+            hook.remove()
+        for hook in self._llm_hooks:
+            hook.remove()
+        self._vision_hooks = []
+        self._llm_hooks = []
+
+def load_deepstack_model(device="cuda:0", deepstack_layer_indexes=None):
+    """
+    加载带有 DeepStack 功能的模型
+    
+    Args:
+        device: 运行设备
+        deepstack_layer_indexes: 要提取的视觉层索引
+            默认 [3, 7, 11]（均匀采样视觉编码器的低/中/高层）
+    
+    Returns:
+        DeepStackModelWrapper 实例
+    """
+    if deepstack_layer_indexes is None:
+        deepstack_layer_indexes = [3, 7, 11]
+    
+    base_model = load_model(device)
+    
+    model = DeepStackModelWrapper(
+        base_model=base_model,
+        deepstack_layer_indexes=deepstack_layer_indexes,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    
+    num_new_params = sum(p.numel() for p in model.deepstack_connectors.parameters())
+    print(f"DeepStack 模型构建完成！")
+    print(f"  视觉编码器提取层: {deepstack_layer_indexes}")
+    print(f"  注入LLM层: {list(range(len(deepstack_layer_indexes)))}")
+    print(f"  DeepStack 新增参数: {num_new_params / 1e6:.1f}M")
+    
+    return model
 def load_processor():
     """
     加载和配置数据处理器
@@ -120,7 +581,7 @@ def load_model(device="cuda:0"):
     smolvlm2_02B_model.model.vocab_size = vocab_size
     smolvlm2_02B_model.config.vocab_size = vocab_size
     smolvlm2_02B_model.config.text_config.vocab_size = vocab_size
-    smolvlm2_02B_model.model.config.vocab_siz = vocab_size
+    smolvlm2_02B_model.model.config.vocab_size = vocab_size
     smolvlm2_02B_model.model.config.text_config.vocab_size = vocab_size
     
     image_token_id = 151655

@@ -7,6 +7,10 @@ seed: 42
 data_seed: 42
 max_steps: 5000
 
+# DeepStack 配置
+use_deepstack: true
+deepstack_layer_indexes: "3,7,11"
+
 # 分阶段训练参数
 training_stage: "all"  # 只训练阶段1进行快速验证
 resume_from_stage: null

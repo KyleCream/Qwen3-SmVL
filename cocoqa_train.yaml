@@ -2,6 +2,11 @@ train_data: "cocoqa"
 seed: 42
 data_seed: 42
 max_steps: 200
+
+# DeepStack 配置
+use_deepstack: true
+deepstack_layer_indexes: "3,7,11"
+
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 dataloader_pin_memory: False
@@ -17,9 +22,9 @@ save_steps: 0.125
 save_total_limit: 8
 optim: "adamw_torch"
 bf16: True
-output_dir: "./model/freeze_llm_vlm_cocoqa"
+output_dir: "./model/deepstack_cocoqa"
 overwrite_output_dir: False
 report_to: "swanlab"
-run_name: "freeze_llm_vlm_cocoqa"
+run_name: "deepstack_cocoqa"
 remove_unused_columns: False
 gradient_checkpointing: False
