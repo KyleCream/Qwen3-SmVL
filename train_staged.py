@@ -35,7 +35,7 @@ class StagedTrainingArgs(TrainingArguments):
     3. 阶段3: 全量微调
     """
     # 数据相关参数
-    train_data: str = "cocoqa"
+    train_data: str = "cocoqa"              # "all"使用全部，或逗号分隔多个如"cocoqa,docvqa,chartqa"
     seed: int = 42
     data_seed: int = 42
     max_steps: Optional[int] = None  # 最大训练步数
@@ -103,7 +103,7 @@ class StagedTrainingArgs(TrainingArguments):
 def load_mm_data(select_data, data_seed=42):
     """
     加载多模态训练数据集
-    
+
     Args:
         select_data: 选择的数据集名称
         data_seed: 数据划分的随机种子
@@ -138,23 +138,35 @@ def load_mm_data(select_data, data_seed=42):
         "docvqa",               # 文档视觉问答数据集
         "dvqa",                 # 条形图问答数据集
     ]
-    
+
+    # 外部数据集：路径和格式不同于 Cauldron，需要转换为统一格式
+    external_datasets = {
+        "chinese_text_recognition": {
+            "path": "./data/chinese_text_recognition/data",
+            "prompt": "请识别图片中的文字。",
+        },
+    }
+
+    all_known_names = list(all_data_names) + list(external_datasets.keys())
+
     if select_data == "all":
-        tmp_data = all_data_names
-    elif select_data in all_data_names:
-        tmp_data = [select_data]
+        tmp_cauldron = all_data_names
+        tmp_external = list(external_datasets.keys())
     else:
-        raise ValueError(f"cannot find {select_data}")
+        # 支持逗号分隔的多个数据集，如 "cocoqa,docvqa,chinese_text_recognition"
+        selected = [s.strip() for s in select_data.split(",")]
+        for name in selected:
+            if name not in all_known_names:
+                raise ValueError(f"找不到数据集: {name}，可用数据集: {all_known_names}")
+        tmp_cauldron = [s for s in selected if s in all_data_names]
+        tmp_external = [s for s in selected if s in external_datasets]
 
     data_list = []
-    for data_name in tmp_data:
+    for data_name in tmp_cauldron:
         try:
-            # 构建数据集路径
             dataset_path = f"data/the_cauldron/{data_name}"
-            # 检查目录是否存在
             import os
             if os.path.exists(dataset_path):
-                # 加载parquet文件
                 dataset = datasets.load_dataset("parquet", data_files=f"{dataset_path}/*.parquet")["train"]
                 data_list.append(dataset)
                 print(f"成功加载数据集: {data_name}")
@@ -162,19 +174,36 @@ def load_mm_data(select_data, data_seed=42):
                 print(f"数据集目录不存在: {dataset_path}")
         except Exception as e:
             print(f"加载数据集失败: {data_name}, 错误: {e}")
-    
+
+    # 加载外部数据集并转换为 Cauldron 统一格式
+    for data_name in tmp_external:
+        try:
+            cfg = external_datasets[data_name]
+            ds = datasets.load_dataset('parquet', data_dir=cfg["path"], split="train")
+            prompt_text = cfg["prompt"]
+
+            def convert_to_cauldron(example):
+                return {
+                    "images": [example["image"]],
+                    "texts": [{"user": prompt_text, "assistant": example["text"], "source": data_name}],
+                }
+
+            ds = ds.map(convert_to_cauldron, remove_columns=["image", "text"])
+            data_list.append(ds)
+            print(f"成功加载外部数据集: {data_name}")
+        except Exception as e:
+            print(f"加载外部数据集失败: {data_name}, 错误: {e}")
+
     # 将所有数据集合并为一个数据集
     raw_data = datasets.concatenate_datasets(data_list)
-    
-    # 划分训练集和测试集：随机选择64条作为测试集，其余作为训练集
-    # 使用固定种子确保结果可复现，64条测试集是为了减少评估时间
+
     raw_data = raw_data.train_test_split(
         64, shuffle=True, seed=data_seed
     )
-    
+
     if select_data == "all":
-        raw_data["train"] = raw_data["train"].select(range(60 * 1024))
-    
+        raw_data["train"] = raw_data["train"].select(range(min(60 * 1024, len(raw_data["train"]))))
+
     return raw_data
 
 
