@@ -20,6 +20,7 @@ eval_steps: 0.125
 save_strategy: "steps"
 save_steps: 0.125
 save_total_limit: 8
+save_safetensors: false
 optim: "adamw_torch"
 bf16: True
 output_dir: "./model/deepstack_cocoqa"

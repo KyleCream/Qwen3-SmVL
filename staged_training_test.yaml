@@ -48,6 +48,7 @@ eval_steps: 500
 save_strategy: "steps"
 save_steps: 500
 save_total_limit: 3
+save_safetensors: false
 
 # 精度和性能设置
 bf16: true
