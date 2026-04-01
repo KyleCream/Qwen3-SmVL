@@ -19,7 +19,7 @@ import swanlab
 from utils import load_model, load_deepstack_model, load_processor
 
 
-device = "cuda"
+device = "cuda"  # 默认设备，多卡训练时会被 accelerate 自动覆盖
 
 ################
 # 分阶段训练参数配置类
@@ -38,7 +38,7 @@ class StagedTrainingArgs(TrainingArguments):
     train_data: str = "cocoqa"              # "all"使用全部，或逗号分隔多个如"cocoqa,docvqa,chartqa"
     seed: int = 42
     data_seed: int = 42
-    max_steps: Optional[int] = None  # 最大训练步数
+    max_steps: Optional[int] = -1   # 最大训练步数，-1表示不限制
     
     # 分阶段训练参数
     training_stage: str = "stage1"  # stage1, stage2, stage3
@@ -319,7 +319,7 @@ def print_trainable_parameters(model):
 ################
 # 数据处理函数
 ################
-def data_collate_fix2k(examples, processor, device, max_length=2048):
+def data_collate_fix2k(examples, processor, max_length=2048):
     """
     数据整理函数：将原始数据转换为模型可以处理的格式
     
@@ -333,7 +333,6 @@ def data_collate_fix2k(examples, processor, device, max_length=2048):
     Args:
         examples: 批量的原始数据样本
         processor: 模型的处理器（包含分词器和图像处理器）
-        device: 运行设备
         max_length: 最大序列长度
     
     Returns:
@@ -378,7 +377,7 @@ def data_collate_fix2k(examples, processor, device, max_length=2048):
     labels[labels == processor.image_token_id] = -100
     
     batch["labels"] = labels
-    return batch.to(device, dtype=torch.bfloat16)
+    return batch.to(dtype=torch.bfloat16)
 
 
 ################
@@ -406,7 +405,7 @@ def train_stage(model, processor, raw_data, stage_args, stage_name):
     
     # 创建数据整理函数
     collate_fn = partial(
-        data_collate_fix2k, processor=processor, device=device
+        data_collate_fix2k, processor=processor
     )
     
     # 检查检查点
@@ -489,13 +488,16 @@ def main(training_args):
     print("正在加载模型和处理器...")
     processor = load_processor()
 
+    # 获取当前进程的设备
+    local_device = f"cuda:{training_args.local_rank}" if training_args.local_rank >= 0 else device
+
     # 根据配置选择普通模型或 DeepStack 模型
     if training_args.use_deepstack:
         deepstack_indexes = [int(x.strip()) for x in training_args.deepstack_layer_indexes.split(",")]
         print(f"使用 DeepStack 模型，视觉层索引: {deepstack_indexes}")
-        model = load_deepstack_model(device, deepstack_layer_indexes=deepstack_indexes)
+        model = load_deepstack_model(local_device, deepstack_layer_indexes=deepstack_indexes)
     else:
-        model = load_model(device)
+        model = load_model(local_device)
     
     # 准备训练数据
     print(f"正在加载数据集: {training_args.train_data}")

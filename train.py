@@ -18,7 +18,10 @@ import swanlab  # 实验跟踪和可视化工具
 
 from utils import load_model, load_deepstack_model, load_processor  # 导入自定义的模型和处理器加载函数
 
-device = "cuda"  # 设置运行设备为GPU
+import warnings
+warnings.filterwarnings("ignore", message="Kwargs passed to `processor.__call__`")
+
+device = "cuda"  # 默认设备，多卡训练时会被 accelerate 自动覆盖
 
 ################
 # 多模态数据集加载函数
@@ -212,7 +215,7 @@ def print_trainable_parameters(model):
 ################
 # 数据处理和批量整理函数
 ################
-def data_collate_fix2k(examples, processor, device, max_length=2048):
+def data_collate_fix2k(examples, processor, max_length=2048):
     """
     数据整理函数：将原始数据转换为模型可以处理的格式
     
@@ -226,7 +229,6 @@ def data_collate_fix2k(examples, processor, device, max_length=2048):
     Args:
         examples: 批量的原始数据样本
         processor: 模型的处理器（包含分词器和图像处理器）
-        device: 运行设备
         max_length: 最大序列长度
     
     Returns:
@@ -284,8 +286,8 @@ def data_collate_fix2k(examples, processor, device, max_length=2048):
     
     batch["labels"] = labels
     
-    # 将数据移动到指定设备并转换为bfloat16精度以节省显存
-    return batch.to(device, dtype=torch.bfloat16)
+    # 转换为bfloat16精度（设备放置由 Trainer 自动处理）
+    return batch.to(dtype=torch.bfloat16)
 
 
 ################
@@ -307,7 +309,7 @@ class MyTrainArgs(TrainingArguments):
     train_data: str = "cocoqa"              # 训练数据集名称："all"使用全部，或逗号分隔多个如"cocoqa,docvqa,chartqa"
     seed: int = 42                          # 随机种子，确保实验可复现
     data_seed: int = 42                     # 数据划分的随机种子
-    max_steps: Optional[int] = None         # 最大训练步数
+    max_steps: Optional[int] = -1         # 最大训练步数
 
     # DeepStack 配置
     use_deepstack: bool = False             # 是否使用 DeepStack 多层视觉特征注入
@@ -372,13 +374,16 @@ def main(training_args):
     print("正在加载模型和处理器...")
     qwen_smvl_processor = load_processor()  # 加载数据处理器（分词器+图像处理器）
 
+    # 获取当前进程的设备（多卡训练时各进程分配不同GPU）
+    local_device = f"cuda:{training_args.local_rank}" if training_args.local_rank >= 0 else device
+
     # 根据配置选择普通模型或 DeepStack 模型
     if training_args.use_deepstack:
         deepstack_indexes = [int(x.strip()) for x in training_args.deepstack_layer_indexes.split(",")]
         print(f"使用 DeepStack 模型，视觉层索引: {deepstack_indexes}")
-        qwen_smvl = load_deepstack_model(device, deepstack_layer_indexes=deepstack_indexes)
+        qwen_smvl = load_deepstack_model(local_device, deepstack_layer_indexes=deepstack_indexes)
     else:
-        qwen_smvl = load_model(device)          # 加载多模态模型到GPU
+        qwen_smvl = load_model(local_device)
     
     # 应用参数冻结策略：只训练连接器层，冻结视觉编码器和语言模型
     print("应用参数冻结策略...")
@@ -396,7 +401,7 @@ def main(training_args):
 
     # 创建数据整理函数（用于批量处理数据）
     collate_fn = partial(
-        data_collate_fix2k, processor=qwen_smvl_processor, device=device
+        data_collate_fix2k, processor=qwen_smvl_processor
     )
 
     ################
