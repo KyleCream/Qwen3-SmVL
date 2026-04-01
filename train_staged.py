@@ -368,8 +368,8 @@ def data_collate_fix2k(examples, processor, max_length=2048):
     batch = processor(
         text=batch_text,
         images=batch_image,
-        return_tensors="pt",
-        tokenizer_kwargs={"max_length": max_length, "padding": "max_length", "truncation": True},
+        common_kwargs={"return_tensors": "pt"},
+        text_kwargs={"max_length": max_length, "padding": "max_length", "truncation": True},
     )
     
     labels = batch["input_ids"].clone()
@@ -567,8 +567,8 @@ def test_inference(model, processor, stage_name):
         batch = processor(
             text=[texts],
             images=images,
-            return_tensors="pt",
-            tokenizer_kwargs={"max_length": 1024, "padding_side": "left", "padding": True},
+            common_kwargs={"return_tensors": "pt"},
+            text_kwargs={"max_length": 1024, "padding_side": "left", "padding": True},
         ).to(model.device, dtype=torch.bfloat16)
         
         generated_ids = model.generate(
