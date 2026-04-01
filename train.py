@@ -449,7 +449,7 @@ def main(training_args):
     
     print("训练完成，保存模型...")
     # 保存训练好的模型
-    qwen_smvl.save_pretrained(training_args.output_dir)
+    qwen_smvl.save_pretrained(training_args.output_dir, safe_serialization=False)
 
     ################
     # 训练后推理测试

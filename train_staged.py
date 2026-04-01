@@ -460,7 +460,7 @@ def train_stage(model, processor, raw_data, stage_args, stage_name):
     
     # 保存模型
     print(f"保存 {stage_name} 模型...")
-    model.save_pretrained(stage_output_dir)
+    model.save_pretrained(stage_output_dir, safe_serialization=False)
     processor.save_pretrained(stage_output_dir)
     
     # 记录到SwanLab
