@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-简化的多模态推理代码
+简化的多模态推理代码，支持对比测试：
+1. Qwen3-SmVL（训练后的混合模型）
+2. Qwen3.5-0.8B（纯文本基线）
+3. SmolVLM2-256M（原始多模态基线）
 """
 
 import os
 import torch
 from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForImageTextToText, AutoProcessor
 from utils import load_model, load_processor
 
 
@@ -114,58 +118,172 @@ def inference(model, processor, image_path, prompt, max_tokens=512, device="cuda
     return response.strip()
 
 
+def load_qwen3_5(device="cuda"):
+    """加载 Qwen3.5-0.8B 原生多模态模型"""
+    model_path = "./model/Qwen3.5-0.8B"
+    print(f"正在加载 Qwen3.5-0.8B: {model_path}")
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    return model, processor
+
+
+def inference_qwen3_5(model, processor, image_path, prompt, max_tokens=512, device="cuda"):
+    """Qwen3.5-0.8B 多模态推理"""
+    if isinstance(image_path, str):
+        image = Image.open(image_path).convert('RGB')
+    else:
+        image = image_path
+
+    messages = [
+        {"role": "system", "content": "使用中文回答所有问题。"},
+        {"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt},
+        ]},
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=text, images=image, return_tensors="pt").to(device)
+
+    for key in inputs:
+        if key == 'pixel_values' and inputs[key] is not None:
+            inputs[key] = inputs[key].to(torch.bfloat16)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0.7,
+            do_sample=True,
+            top_p=0.9,
+            use_cache=True
+        )
+
+    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+    return processor.decode(generated_ids, skip_special_tokens=True).strip()
+
+
+def load_smolvlm2(device="cuda"):
+    """加载原始 SmolVLM2-256M-Video-Instruct 模型"""
+    model_path = "./model/SmolVLM2-256M-Video-Instruct"
+    print(f"正在加载 SmolVLM2-256M: {model_path}")
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, _attn_implementation="eager"
+    ).to(device).eval()
+    return model, processor
+
+
+def inference_smolvlm2(model, processor, image_path, prompt, max_tokens=512, device="cuda"):
+    """SmolVLM2-256M 多模态推理"""
+    if isinstance(image_path, str):
+        image = Image.open(image_path).convert('RGB')
+    else:
+        image = image_path
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": prompt},
+        ]},
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=text, images=image, return_tensors="pt").to(device)
+
+    for key in inputs:
+        if key == 'pixel_values' and inputs[key] is not None:
+            inputs[key] = inputs[key].to(torch.bfloat16)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0.7,
+            do_sample=True,
+            top_p=0.9,
+            use_cache=True
+        )
+
+    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+    return processor.decode(generated_ids, skip_special_tokens=True).strip()
+
+
+def run_test(name, infer_fn, prompts):
+    """运行一组推理测试并打印结果"""
+    print(f"\n{'='*60}")
+    print(f"  {name}")
+    print(f"{'='*60}")
+    for i, (prompt, kwargs) in enumerate(prompts, 1):
+        print(f"\n{i}. 提示: {prompt}")
+        print("-" * 50)
+        try:
+            response = infer_fn(prompt, **kwargs)
+            print(f"回复: {response}")
+        except Exception as e:
+            print(f"推理失败: {e}")
+
+
 def main():
-    """主函数"""
-    # 配置
-    model_path = "./model/staged_training_test/stage2"
-    image_path = "./resource/dog.png"  # 演示图片
+    """主函数：对比三个模型的推理结果"""
+    trained_model_path = "./model/staged_training_test/stage2"
+    image_path = "./resource/dog.png"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print("🚀 开始推理演示...")
-    print(f"模型路径: {model_path}")
-    print(f"设备: {device}")
-    
-    # 检查文件是否存在
-    if not os.path.exists(model_path):
-        print(f"❌ 模型路径不存在: {model_path}")
-        return
-    
+
+    prompts_vision = [
+        "请描述这张图片。",
+        "图片中有什么东西？",
+        "图中的数量有多少？"
+    ]
+
     if not os.path.exists(image_path):
-        print(f"❌ 图像文件不存在: {image_path}")
+        print(f"图像文件不存在: {image_path}")
         return
-    
+
+    # ========== 1. Qwen3-SmVL（训练后的混合模型） ==========
+    if os.path.exists(trained_model_path):
+        try:
+            model, processor = load_trained_model(trained_model_path, device)
+            run_test(
+                "Qwen3-SmVL（训练后模型）",
+                lambda p, **kw: inference(model, processor, image_path, p, device=device),
+                [(p, {}) for p in prompts_vision],
+            )
+            del model, processor
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Qwen3-SmVL 加载失败: {e}")
+    else:
+        print(f"\n跳过 Qwen3-SmVL：路径不存在 {trained_model_path}")
+
+    # ========== 2. Qwen3.5-0.8B（原生多模态基线） ==========
     try:
-        # 加载模型
-        model, processor = load_trained_model(model_path, device)
-        print("✅ 模型加载完成")
-        
-        # 测试推理
-        prompts = [
-            "请描述这张图片。",
-            "图片中有什么东西？",
-            "图中的数量有多少？"
-        ]
-        
-        print(f"\n📸 测试图片: {image_path}")
-        print("="*60)
-        
-        for i, prompt in enumerate(prompts, 1):
-            print(f"\n{i}. 提示: {prompt}")
-            print("-" * 50)
-            
-            try:
-                response = inference(model, processor, image_path, prompt, device=device)
-                print(f"回复: {response}")
-            except Exception as e:
-                print(f"❌ 推理失败: {e}")
-        
-        print("\n" + "="*60)
-        print("演示完成！")
-        
+        model_q, processor_q = load_qwen3_5(device)
+        run_test(
+            "Qwen3.5-0.8B（原生多模态基线）",
+            lambda p, **kw: inference_qwen3_5(model_q, processor_q, image_path, p, device=device),
+            [(p, {}) for p in prompts_vision],
+        )
+        del model_q, processor_q
+        torch.cuda.empty_cache()
     except Exception as e:
-        print(f"❌ 程序执行失败: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Qwen3.5-0.8B 加载失败: {e}")
+
+    # ========== 3. SmolVLM2-256M（原始多模态基线） ==========
+    try:
+        model_s, processor_s = load_smolvlm2(device)
+        run_test(
+            "SmolVLM2-256M（原始多模态基线）",
+            lambda p, **kw: inference_smolvlm2(model_s, processor_s, image_path, p, device=device),
+            [(p, {}) for p in prompts_vision],
+        )
+        del model_s, processor_s
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"SmolVLM2-256M 加载失败: {e}")
+
+    print(f"\n{'='*60}")
+    print("全部对比测试完成！")
 
 
 if __name__ == "__main__":
