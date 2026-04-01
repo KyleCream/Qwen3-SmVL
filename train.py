@@ -269,12 +269,10 @@ def data_collate_fix2k(examples, processor, device, max_length=2048):
 
     # 使用处理器对文本和图像进行编码
     batch = processor(
-        text=batch_text,           # 文本列表
-        images=batch_image,        # 图像列表
-        max_length=max_length,     # 最大长度
-        return_tensors="pt",       # 返回PyTorch张量
-        padding="max_length",      # 填充到最大长度
-        truncation=True,           # 启用截断
+        text=batch_text,
+        images=batch_image,
+        return_tensors="pt",
+        tokenizer_kwargs={"max_length": max_length, "padding": "max_length", "truncation": True},
     )
     
     # 创建训练标签：复制input_ids作为标签
@@ -491,12 +489,10 @@ def main(training_args):
             
             # 处理输入数据
             batch = qwen_smvl_processor(
-                text=[texts],           # 文本列表
-                images=images,          # 图像列表
-                max_length=1024,        # 最大长度
-                return_tensors="pt",    # 返回PyTorch张量
-                padding_side="left",    # 左侧填充
-                padding=True,           # 启用填充
+                text=[texts],
+                images=images,
+                return_tensors="pt",
+                tokenizer_kwargs={"max_length": 1024, "padding_side": "left", "padding": True},
             ).to(qwen_smvl.device, dtype=torch.bfloat16)
             
             # 生成回答
