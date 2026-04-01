@@ -574,6 +574,10 @@ def load_model(device="cuda:0"):
     print("正在替换语言模型组件...")
     smolvlm2_02B_model.model.text_model = qwen3_06b_model.model
     smolvlm2_02B_model.lm_head = qwen3_06b_model.lm_head
+
+    # 解除 lm_head 和 embed_tokens 的 weight tying，避免保存时共享内存报错
+    smolvlm2_02B_model.lm_head.weight = torch.nn.Parameter(smolvlm2_02B_model.lm_head.weight.clone())
+    smolvlm2_02B_model.config.tie_word_embeddings = False
     
     print("正在更新模型配置...")
     vocab_size = qwen3_06b_model.vocab_size
