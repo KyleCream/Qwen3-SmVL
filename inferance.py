@@ -26,16 +26,16 @@ def load_trained_model(checkpoint_path, device="cuda"):
     model = load_model(device)
     processor = load_processor()
     
-    # 加载训练后的权重
-    if os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
+    # 加载训练后的权重（优先pytorch_model.bin）
+    if os.path.exists(os.path.join(checkpoint_path, "pytorch_model.bin")):
+        print("正在加载pytorch权重...")
+        state_dict = torch.load(os.path.join(checkpoint_path, "pytorch_model.bin"), map_location=device)
+        model.load_state_dict(state_dict, strict=False)
+        print("✅ 权重加载成功")
+    elif os.path.exists(os.path.join(checkpoint_path, "model.safetensors")):
         print("正在加载safetensors权重...")
         from safetensors.torch import load_file
         state_dict = load_file(os.path.join(checkpoint_path, "model.safetensors"))
-        model.load_state_dict(state_dict, strict=False)
-        print("✅ 权重加载成功")
-    elif os.path.exists(os.path.join(checkpoint_path, "pytorch_model.bin")):
-        print("正在加载pytorch权重...")
-        state_dict = torch.load(os.path.join(checkpoint_path, "pytorch_model.bin"), map_location=device)
         model.load_state_dict(state_dict, strict=False)
         print("✅ 权重加载成功")
     else:

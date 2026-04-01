@@ -79,6 +79,7 @@ class StagedTrainingArgs(TrainingArguments):
     save_strategy: str = "steps"
     save_steps: int = 10
     save_total_limit: int = 8
+    save_safetensors: bool = False         # 使用pytorch_model.bin格式保存
     
     # 精度和性能设置
     bf16: bool = True
@@ -212,6 +213,10 @@ def apply_stage_freeze(model, stage: str):
         for _, param in model.model.connector.named_parameters():
             param.requires_grad = True
 
+        print("解冻 lm_head（输出头需要和 connector 一起训练）...")
+        for _, param in model.lm_head.named_parameters():
+            param.requires_grad = True
+
         # DeepStack: 同时训练 deepstack_connectors
         if hasattr(model, 'deepstack_connectors'):
             print("训练 DeepStack connectors...")
@@ -226,6 +231,10 @@ def apply_stage_freeze(model, stage: str):
 
         print("保持连接器可训练...")
         for _, param in model.model.connector.named_parameters():
+            param.requires_grad = True
+
+        print("保持 lm_head 可训练...")
+        for _, param in model.lm_head.named_parameters():
             param.requires_grad = True
 
         print("冻结文本模型...")

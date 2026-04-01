@@ -78,7 +78,10 @@ def load_mm_data(select_data):
         try:
             # 从Cauldron数据集集合中加载指定数据集的训练部分
             data_list.append(
-                datasets.load_dataset("data/the_cauldron", data_name)["train"]
+                datasets.load_dataset('parquet',
+                                    data_dir=f'./data/the_cauldron/{data_name}',
+                                    split="train"
+                                    )
             )
         except:
             print(f"bad dataset:{data_name}")  # 打印加载失败的数据集
@@ -124,6 +127,14 @@ def freeze_model(qwen_smvl):
     # 冻结视觉模型（图像编码器）的所有参数
     for _, param in qwen_smvl.model.vision_model.named_parameters():
         param.requires_grad = False
+
+    # 显式解冻主连接器（视觉特征到语言特征的映射层）
+    for _, param in qwen_smvl.model.connector.named_parameters():
+        param.requires_grad = True
+
+    # 解冻 lm_head（输出头需要和 connector 一起训练，否则推理会输出乱码）
+    for _, param in qwen_smvl.lm_head.named_parameters():
+        param.requires_grad = True
 
     # 如果是 DeepStack 模型，确保 deepstack_connectors 可训练
     if hasattr(qwen_smvl, 'deepstack_connectors'):
@@ -292,6 +303,7 @@ class MyTrainArgs(TrainingArguments):
     save_strategy: str = "steps"           # 保存策略：按步数保存
     save_steps: int = 10                   # 每10步保存一次检查点
     save_total_limit: int = 8              # 最多保留8个检查点
+    save_safetensors: bool = False         # 使用pytorch_model.bin格式保存（safetensors格式可能报错）
     
     # 精度和性能设置
     bf16: bool = True                      # 使用bfloat16混合精度训练（节省显存，加速训练）
