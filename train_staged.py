@@ -189,6 +189,7 @@ def load_mm_data(select_data, data_seed=42):
                 }
 
             ds = ds.map(convert_to_cauldron, remove_columns=["image", "text"])
+            ds = ds.cast_column("images", datasets.Sequence(datasets.Image()))
             data_list.append(ds)
             print(f"成功加载外部数据集: {data_name}")
         except Exception as e:

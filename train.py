@@ -116,6 +116,8 @@ def load_mm_data(select_data):
                 }
 
             ds = ds.map(convert_to_cauldron, remove_columns=["image", "text"])
+            # 将 images 列转换为 Image 特征类型，与 Cauldron 数据集对齐
+            ds = ds.cast_column("images", datasets.Sequence(datasets.Image()))
             data_list.append(ds)
             print(f"成功加载外部数据集: {data_name}")
         except Exception as e:
